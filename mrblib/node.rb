@@ -85,21 +85,22 @@ class Raft
           prev_log_entry = MessagePack.unpack(prev_log_entry.last)
           if prev_log_entry[:term] != prev_log_term
             result[:success] = false
-            break
           end
           if prev_log_entry[:term] == prev_log_term
             if prev_log_entry[:index] == prev_log_index
               result[:success] = true
             else
               result[:success] = false
-              break
             end
           end
-        elsif cursor.last(nil, nil, true).nil? || (prev_log_term == 0 && prev_log_index == 0)
-          result[:success] = true
+        elsif cursor.last(nil, nil, true).nil?
+          if entry && entry[:index] == 1
+            result[:success] = true
+          else
+            result[:success] = false
+          end
         else
           result[:success] = false
-          break
         end
 
         if entry
@@ -114,7 +115,7 @@ class Raft
             end
           end
 
-          cursor.put(index, entry.to_msgpack, MDB::APPEND)
+          cursor.put(index, entry.to_msgpack)
         end
         if leader_commit > @commit_index
           if entry
