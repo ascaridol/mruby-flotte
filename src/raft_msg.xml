@@ -1,0 +1,34 @@
+<class name = "raft_msg"
+    signature = "6"
+    title = "raft over zyre"
+    script = "zproto_codec_mruby"
+    package_dir = "."
+    virtual = "1"
+    >
+    <message name = "AppendEntry" id = "1">
+        <field name = "term" type = "number" size = "8">leader's term</field>
+        <field name = "prevLogIndex" type = "number" size = "8">index of log entry immediately preceding new ones</field>
+        <field name = "prevLogTerm" type = "number" size = "8">term of prevLogIndex entry</field>
+        <field name = "entry" type = "chunk">log entry to store</field>
+        <field name = "leaderCommit" type = "number" size = "8">leader’s commitIndex</field>
+        Invoked by leader to replicate log entries (§5.3); also used as heartbeat (§5.2).
+    </message>
+
+    <message name = "AppendEntry Reply" id = "2">
+        <field name = "term" type = "number" size = "8">currentTerm, for leader to update itself</field>
+        <field name = "success" type = "number" size = "1">1 if follower contained entry matching prevLogIndex and prevLogTerm</field>
+    </message>
+
+    <message name = "RequestVote" id = "3">
+        <field name = "term" type = "number" size = "8">candidate’s term</field>
+        <field name = "lastLogIndex" type = "number" size = "8">index of candidate’s last log entry (§5.4)</field>
+        <field name = "lastLogTerm" type = "number" size = "8">term of candidate’s last log entry (§5.4)</field>
+        Invoked by candidates to gather votes (§5.2).
+    </message>
+
+    <message name = "RequestVote Reply" id = "4">
+        <field name = "term" type = "number" size = "8">currentTerm, for candidate to update itself</field>
+        <field name = "voteGranted" type = "number" size = "1">1 means candidate received vote</field>
+    </message>
+
+</class>
