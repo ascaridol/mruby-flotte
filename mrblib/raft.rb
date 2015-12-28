@@ -8,7 +8,7 @@ class Raft
   end
 
   def send(method, *args)
-    @pipe.sendx({rpc: :call, id: ActorMessage::SEND_MESSAGE, method: method, args: args}.to_msgpack)
+    @pipe.sendx({rpc: :call, id: ActorMessage::SEND_MESSAGE, uuid: RandomBytes.buf(16), method: method, args: args}.to_msgpack)
     result = MessagePack.unpack(CZMQ::Zframe.recv(@pipe).to_str(true))
     case result[:id]
     when ActorMessage::SEND_OK

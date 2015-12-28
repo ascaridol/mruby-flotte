@@ -12,17 +12,23 @@ class Raft
     end
 
     state :leader, to: [:follower] do
-      @next_index = {}
-      @match_index = {}
+      @acknowledged_messages = {}
       next_index = 2
       if (last_entry = last_log_entry)
         next_index = last_entry[:index] + 1
       end
       @peers.each do |peer|
-        @next_index[peer] = next_index
-        @match_index[peer] = 0
+        peer[:next_index] = next_index
+        peer[:match_index] = 0
       end
-      send_heartbeat
+      if !@queued_requests.empty?
+        @queued_requests.keys.each do |uuid|
+          msg = @queued_requests.delete(uuid)
+          replicate_message(msg, uuid)
+        end
+      else
+        send_heartbeat
+      end
       @timer.delay = 70
     end
 
@@ -36,7 +42,7 @@ class Raft
       @state = :follower
       @evasive = []
       @peers = {}
-      @queued_requests = []
+      @queued_requests = {}
       @env = MDB::Env.new(maxdbs: 3)
       @env.open("#{@name}-#{@class}.lmdb", MDB::NOSUBDIR)
       @current_term_db = @env.database(MDB::INTEGERKEY | MDB::CREATE, "currentTerm")
@@ -68,6 +74,7 @@ class Raft
         enter_new_term(term)
       end
 
+      self.leader_id = leader_id
       @timer.reset
 
       result = nil
@@ -196,9 +203,9 @@ class Raft
         term: current_term,
         entry: nil,
         leaderCommit: @commit_index}
-      if (prev_entry = prev_log_entry)
-        append_entry_rpc[:prev_log_index] = prev_entry[:index]
-        append_entry_rpc[:prev_log_term] = prev_entry[:term]
+      if (log_entry = last_log_entry)
+        append_entry_rpc[:prev_log_index] = log_entry[:index]
+        append_entry_rpc[:prev_log_term] = log_entry[:term]
       else
         append_entry_rpc[:prev_log_index] = 0
         append_entry_rpc[:prev_log_term] = 0
@@ -207,17 +214,12 @@ class Raft
     end
 
     def pipe(pipe_pi)
-      msg = CZMQ::Zframe.recv(@pipe).to_str(true)
+      msg = CZMQ::Zframe.recv(@pipe).to_str
       payload = MessagePack.unpack(msg)
       case payload[:id]
       when ActorMessage::SEND_MESSAGE
         begin
-          if (vf = voted_for)
-            if vf == @name
-            else
-              @zyre.whisper(@peers[vf], msg)
-            end
-          end
+          replicate_message(msg, payload)
           result = @instance.__send__(payload[:method], *payload[:args])
           @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
         rescue => e
@@ -263,7 +265,7 @@ class Raft
       when 'JOIN'
         channel = msg[3]
         if channel == @channel
-          @peers[name] = uuid
+          @peers[name] = {uuid: uuid}
         end
       when 'EVASIVE'
         unless @evasive.include?(uuid)
@@ -273,9 +275,15 @@ class Raft
         channel = msg[3]
         if channel == @channel
           @peers.delete(name)
+          if name == voted_for || name == @leader_id
+            transition :candidate
+          end
         end
       when 'EXIT'
         @peers.delete(name)
+        if name == voted_for || name == @leader_id
+          transition :candidate
+        end
       end
     end
 
@@ -289,6 +297,35 @@ class Raft
         start_new_election
       when :leader
         send_heartbeat
+      end
+    end
+
+    def replicate_message(msg, payload)
+      if leader?
+        append_entry_rpc = {rpc: :append_entry,
+          term: current_term,
+          leader_id: @name,
+          entry: payload,
+          leader_commit: @commit_index}
+        @log_db.cursor do |cursor|
+          if (log_entry = cursor.last(nil, nil, true))
+            entry = MessagePack.unpack(log_entry.last)
+            payload[:index] = log_entry.first.to_fix.next
+            append_entry_rpc[:prev_log_index] = entry[:index]
+            append_entry_rpc[:prev_log_term] = entry[:term]
+          else
+            payload[:index] = 1
+            append_entry_rpc[:prev_log_index] = 0
+            append_entry_rpc[:prev_log_term] = 0
+          end
+          log = {index: payload[:index], term: payload[:term], method: payload[:method], args: payload[:args]}.to_msgpack
+          cursor.put(payload[:index].to_bin, log, MDB::APPEND)
+        end
+        @zyre.shout(@channel, append_entry_rpc.to_msgpack)
+      elsif @leader_id
+        @zyre.whisper(@peers[@leader_id][:uuid], msg)
+      else
+        @queued_requests[payload[:uuid]] = msg
       end
     end
 
@@ -322,7 +359,20 @@ class Raft
         increment_current_term
       end
       @voted_for_db.del(ZERO)
+      @leader_id = nil
       transition :follower
+    end
+
+    def self.leader_id=(leader_id)
+      if leader_id
+        @leader_id = leader_id
+        if !@queued_requests.empty?
+          @queued_requests.keys.each do |uuid|
+            msg = @queued_requests.delete(uuid)
+            replicate_message(msg, uuid)
+          end
+        end
+      end
     end
 
     def voted_for
@@ -340,18 +390,6 @@ class Raft
       else
         nil
       end
-    end
-
-    def prev_log_entry
-      entry = nil
-      @log_db.cursor(MDB::RDONLY) do |cursor|
-        if cursor.last(nil, nil, true)
-          if (prev_entry = cursor.prev(nil, nil, true))
-            entry = MessagePack.unpack(prev_entry.last)
-          end
-        end
-      end
-      entry
     end
   end
 end
