@@ -1,7 +1,11 @@
 class Raft
+  class Error < StandardError; end
+  class LogError < Error; end
+
   class Node
     include StateMachine
     ZERO = 0.to_bin.freeze
+    ONE = 1.to_bin.freeze
 
     state :follower, to: [:candidate] do
       @timer.delay = 150 + RandomBytes.uniform(150)
@@ -12,23 +16,17 @@ class Raft
     end
 
     state :leader, to: [:follower] do
-      @acknowledged_messages = {}
-      next_index = 2
+      puts "#{@name} is the leader"
+      next_index = 1
       if (last_entry = last_log_entry)
         next_index = last_entry[:index] + 1
       end
-      @peers.each do |peer|
+      @peers.each_value do |peer|
         peer[:next_index] = next_index
         peer[:match_index] = 0
       end
-      if !@queued_requests.empty?
-        @queued_requests.keys.each do |uuid|
-          msg = @queued_requests.delete(uuid)
-          replicate_message(msg, uuid)
-        end
-      else
-        send_heartbeat
-      end
+      @leader_id = @name
+      replicate_log(true)
       @timer.delay = 70
     end
 
@@ -42,7 +40,6 @@ class Raft
       @state = :follower
       @evasive = []
       @peers = {}
-      @queued_requests = {}
       @env = MDB::Env.new(maxdbs: 3)
       @env.open("#{@name}-#{@class}.lmdb", MDB::NOSUBDIR)
       @current_term_db = @env.database(MDB::INTEGERKEY | MDB::CREATE, "currentTerm")
@@ -56,48 +53,53 @@ class Raft
       @zyre = Zyre.new(@name)
       @reactor.poller(@zyre.socket, &method(:zyre))
       @zyre.start
+      @zyre.join(@channel)
     end
 
     def start
-      @zyre.join(@channel)
       @timer ||= @reactor.timer(150 + RandomBytes.uniform(150), 0, &method(:timer))
       @reactor.run
     end
 
     private
 
-    def append_entry(term, leader_id, prev_log_index, prev_log_term, entry, leader_commit)
+    def append_entry_rpc(leader_id, request)
       ct = current_term
+      term = request[:term]
       if term < ct
         return {rpc: :append_entry_reply, term: ct, success: false}
       elsif term > ct
         enter_new_term(term)
       end
 
-      self.leader_id = leader_id
+      @leader_id = leader_id
       @timer.reset
 
-      result = nil
+      result = {rpc: :append_entry_reply, term: current_term}
 
       @log_db.cursor do |cursor|
+        prev_log_index = request[:prev_log_index]
+        prev_log_term = request[:prev_log_term]
+        entry = request[:entry]
+        leader_commit = request[:leader_commit]
         if (log_entry = cursor.set_key(prev_log_index.to_bin, nil, true))
           log_entry = MessagePack.unpack(log_entry.last)
           if log_entry[:term] != prev_log_term
-            result = {rpc: :append_entry_reply, term: current_term, success: false}
+            result[:success] = false
             break
           end
           if log_entry[:term] == prev_log_term
             if log_entry[:index] == prev_log_index
-              result = {rpc: :append_entry_reply, term: current_term, success: true}
+              result[:success] = true
             else
-              result = {rpc: :append_entry_reply, term: current_term, success: false}
+              result[:success] = false
               break
             end
           end
         elsif cursor.last(nil, nil, true).nil?
-          result = {rpc: :append_entry_reply, term: current_term, success: true}
+          result[:success] = true
         else
-          result = {rpc: :append_entry_reply, term: current_term, success: false}
+          result[:success] = false
           break
         end
 
@@ -125,7 +127,7 @@ class Raft
         while @commit_index > @last_applied
           if (log_entry = cursor.next(nil, nil, true))
             log_entry = MessagePack.unpack(log_entry.last)
-            @class.__send__(log_entry[:method], *log_entry[:args])
+            @class.__send__(log_entry[:command][:method], *log_entry[:command][:args])
             @last_applied += 1
           else
             raise KeyError, "no such key: #{@last_applied}"
@@ -136,14 +138,47 @@ class Raft
       result
     end
 
-    def append_entry_reply(term, follower_id, success)
+    def append_entry_reply(follower_id, request)
+      ct = current_term
+      term = request[:term]
       if term > ct
         enter_new_term(term)
+      elsif request[:success]
+        index = @peers[follower_id][:next_index]
+        @peers[follower_id][:next_index] += 1
+        @peers[follower_id][:match_index] = index
+        if index > @commit_index && (log_entry = @log_db[index.to_bin])
+          entry = MessagePack.unpack(log_entry.last)
+          if entry[:term] == ct
+            matched_indexes = 1
+            @peers.each_value do |peer|
+              if peer[:match_index] >= index && (matched_indexes += 1) >= quorum
+                @commit_index = index
+                break
+              end
+            end
+          end
+        end
+      elsif @peers[follower_id][:next_index] > 1 && (log_entry = @log_db[(@peers[follower_id][:next_index] -= 1).to_bin])
+        log_entry = MessagePack.unpack(log_entry.last)
+        append_entry_rpc = {rpc: :append_entry,
+          term: current_term,
+          prev_log_index: log_entry[:index] - 1,
+          entry: log_entry,
+          leader_commit: @commit_index}
+        if (prev_log_entry = @log_db[append_entry_rpc[:prev_log_index].to_bin])
+          prev_log_entry = MessagePack.unpack(prev_log_entry.last)
+          append_entry_rpc[:prev_log_term] = prev_log_entry[:term]
+        else
+          append_entry_rpc[:prev_log_term] = 0
+        end
+        @zyre.whisper(@peers[follower_id][:uuid], append_entry_rpc.to_msgpack)
       end
     end
 
-    def request_vote(term, candidate_id, last_log_index, last_log_term)
+    def request_vote_rpc(candidate_id, request)
       ct = current_term
+      term = request[:term]
       if term < ct
         return {rpc: :request_vote_reply, term: ct, vote_granted: false}
       elsif term > ct
@@ -153,12 +188,10 @@ class Raft
       vf = voted_for
       if vf == nil || vf == candidate_id
         if (last_entry = last_log_entry)
-          if last_log_index >= last_entry[:index]
-            if last_log_term >= last_entry[:term]
-              self.voted_for = candidate_id
-              @timer.reset
-              return {rpc: :request_vote_reply, term: current_term, vote_granted: true}
-            end
+          if request[:last_log_index] >= last_entry[:index] && request[:last_log_term] >= last_entry[:term]
+            self.voted_for = candidate_id
+            @timer.reset
+            return {rpc: :request_vote_reply, term: current_term, vote_granted: true}
           end
         else
           self.voted_for = candidate_id
@@ -170,11 +203,12 @@ class Raft
       {rpc: :request_vote_reply, term: current_term, vote_granted: false}
     end
 
-    def request_vote_reply(term, candidate_id, vote_granted)
+    def request_vote_reply(candidate_id, request)
+      term = request[:term]
       if term > current_term
         enter_new_term(term)
       else
-        if @state == :candidate && vote_granted
+        if candidate? && request[:vote_granted]
           if (@recieved_votes += 1) >= quorum
             transition :leader
           end
@@ -198,36 +232,22 @@ class Raft
       @timer.delay = 150 + RandomBytes.uniform(150)
     end
 
-    def send_heartbeat
-      append_entry_rpc = {rpc: :append_entry,
-        term: current_term,
-        entry: nil,
-        leaderCommit: @commit_index}
-      if (log_entry = last_log_entry)
-        append_entry_rpc[:prev_log_index] = log_entry[:index]
-        append_entry_rpc[:prev_log_term] = log_entry[:term]
-      else
-        append_entry_rpc[:prev_log_index] = 0
-        append_entry_rpc[:prev_log_term] = 0
-      end
-      @zyre.shout(@channel, append_entry_rpc.to_msgpack)
-    end
-
     def pipe(pipe_pi)
       msg = CZMQ::Zframe.recv(@pipe).to_str
       payload = MessagePack.unpack(msg)
       case payload[:id]
       when ActorMessage::SEND_MESSAGE
         begin
-          replicate_message(msg, payload)
-          result = @instance.__send__(payload[:method], *payload[:args])
+          append_entry(msg, payload)
+          replicate_log
+          result = @instance.__send__(payload[:command][:method], *payload[:command][:args])
           @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
         rescue => e
           @pipe.sendx({id: ActorMessage::ERROR, mrb_class: e.class, error: e.to_s}.to_msgpack)
         end
       when ActorMessage::ASYNC_SEND_MESSAGE
         begin
-          @instance.__send__(payload[:method], *payload[:args])
+          @instance.__send__(payload[:command][:method], *payload[:command][:args])
         rescue => e
           CZMQ::Zsys.error(e.inspect)
         end
@@ -247,20 +267,20 @@ class Raft
           request = MessagePack.unpack(msg[4])
           case request[:rpc]
           when :request_vote
-            @zyre.whisper(uuid, request_vote(request[:term], name, request[:last_log_index], request[:last_log_term]).to_msgpack)
-          when :append_entry
-            @zyre.whisper(uuid, append_entry(request[:term], name, request[:prev_log_index], request[:prev_log_term], request[:entry], request[:leader_commit]).to_msgpack)
+            @zyre.whisper(uuid, request_vote_rpc(name, request).to_msgpack)
           end
         end
       when 'WHISPER'
         request = MessagePack.unpack(msg[3])
         case request[:rpc]
         when :request_vote_reply
-          request_vote_reply(request[:term], name, request[:vote_granted])
+          request_vote_reply(name, request)
         when :append_entry_reply
-          append_entry_reply(request[:term], name, request[:success])
+          append_entry_reply(name, request)
+        when :append_entry
+          @zyre.whisper(uuid, append_entry_rpc(name, request).to_msgpack)
         when :call
-          call(request[:method], *request[:args])
+          call(payload[:command][:method], *payload[:command][:args])
         end
       when 'JOIN'
         channel = msg[3]
@@ -275,57 +295,82 @@ class Raft
         channel = msg[3]
         if channel == @channel
           @peers.delete(name)
-          if name == voted_for || name == @leader_id
-            transition :candidate
-          end
         end
       when 'EXIT'
         @peers.delete(name)
-        if name == voted_for || name == @leader_id
-          transition :candidate
-        end
       end
     end
 
     def timer(timer_id)
       case @state
       when :follower
-        unless voted_for
+        unless @leader_id
           transition :candidate
         end
       when :candidate
         start_new_election
       when :leader
-        send_heartbeat
+        replicate_log(true)
       end
     end
 
-    def replicate_message(msg, payload)
+    def append_entry(msg, payload)
       if leader?
-        append_entry_rpc = {rpc: :append_entry,
-          term: current_term,
-          leader_id: @name,
-          entry: payload,
-          leader_commit: @commit_index}
         @log_db.cursor do |cursor|
           if (log_entry = cursor.last(nil, nil, true))
-            entry = MessagePack.unpack(log_entry.last)
             payload[:index] = log_entry.first.to_fix.next
-            append_entry_rpc[:prev_log_index] = entry[:index]
-            append_entry_rpc[:prev_log_term] = entry[:term]
           else
             payload[:index] = 1
-            append_entry_rpc[:prev_log_index] = 0
-            append_entry_rpc[:prev_log_term] = 0
           end
-          log = {index: payload[:index], term: payload[:term], method: payload[:method], args: payload[:args]}.to_msgpack
-          cursor.put(payload[:index].to_bin, log, MDB::APPEND)
+          payload[:term] = current_term
+          cursor.put(payload[:index].to_bin, payload.to_msgpack, MDB::APPEND)
         end
-        @zyre.shout(@channel, append_entry_rpc.to_msgpack)
       elsif @leader_id
         @zyre.whisper(@peers[@leader_id][:uuid], msg)
       else
-        @queued_requests[payload[:uuid]] = msg
+        raise Error, "no leader elected"
+      end
+    end
+
+    def replicate_log(is_heartbeat = false)
+      append_entry_rpc = {rpc: :append_entry,
+        term: current_term,
+        leader_commit: @commit_index}
+
+      last_log_index = 0
+
+      @log_db.cursor(MDB::RDONLY) do |cursor|
+        if (last_entry = cursor.last(nil, nil, true))
+          if is_heartbeat
+            last_log_index = last_entry.first.to_fix
+          else
+            append_entry_rpc[:entry] = MessagePack.unpack(last_entry.last)
+            last_log_index = append_entry_rpc[:entry][:index]
+          end
+          if (prev_log_entry = cursor.prev(nil, nil, true))
+            prev_log_entry = MessagePack.unpack(prev_log_entry.last)
+            append_entry_rpc[:prev_log_index] = prev_log_entry[:index]
+            append_entry_rpc[:prev_log_term] = prev_log_entry[:term]
+          else
+            append_entry_rpc[:prev_log_index] = 0
+            append_entry_rpc[:prev_log_term] = 0
+          end
+        elsif is_heartbeat
+          append_entry_rpc[:prev_log_index] = 0
+          append_entry_rpc[:prev_log_term] = 0
+        else
+          raise LogError, "cannot replicate empty log"
+        end
+      end
+
+      append_entry_rpc = append_entry_rpc.to_msgpack
+
+      @peers.each_value do |peer|
+        if last_log_index >= peer[:next_index]
+          @zyre.whisper(peer[:uuid], append_entry_rpc)
+        elsif is_heartbeat
+          @zyre.whisper(peer[:uuid], append_entry_rpc)
+        end
       end
     end
 
@@ -361,18 +406,6 @@ class Raft
       @voted_for_db.del(ZERO)
       @leader_id = nil
       transition :follower
-    end
-
-    def self.leader_id=(leader_id)
-      if leader_id
-        @leader_id = leader_id
-        if !@queued_requests.empty?
-          @queued_requests.keys.each do |uuid|
-            msg = @queued_requests.delete(uuid)
-            replicate_message(msg, uuid)
-          end
-        end
-      end
     end
 
     def voted_for
