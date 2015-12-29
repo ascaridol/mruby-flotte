@@ -276,7 +276,15 @@ class Raft
       when 'JOIN'
         channel = msg[3]
         if channel == @channel
-          @peers[name] = {uuid: uuid}
+          if leader?
+            next_index = 1
+            if (last_entry = last_log_entry)
+              next_index = last_entry[:index] + 1
+            end
+            @peers[name] = {uuid: uuid, next_index: next_index, match_index: 0}
+          else
+            @peers[name] = {uuid: uuid}
+          end
         end
       when 'EVASIVE'
         unless @evasive.include?(uuid)
