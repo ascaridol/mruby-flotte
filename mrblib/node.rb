@@ -5,7 +5,6 @@ class Raft
   class Node
     include StateMachine
     ZERO = 0.to_bin.freeze
-    ONE = 1.to_bin.freeze
 
     state :follower, to: [:candidate] do
       @timer.delay = 150 + RandomBytes.uniform(150)
@@ -57,7 +56,7 @@ class Raft
     end
 
     def start
-      @timer ||= @reactor.timer(150 + RandomBytes.uniform(150), 0, &method(:timer))
+      @timer = @reactor.timer(150 + RandomBytes.uniform(150), 0, &method(:timer))
       @reactor.run
     end
 
@@ -80,23 +79,23 @@ class Raft
       @log_db.cursor do |cursor|
         prev_log_index = request[:prev_log_index]
         prev_log_term = request[:prev_log_term]
-        entry = request[:entry]
         leader_commit = request[:leader_commit]
-        if (log_entry = cursor.set_key(prev_log_index.to_bin, nil, true))
-          log_entry = MessagePack.unpack(log_entry.last)
-          if log_entry[:term] != prev_log_term
+        entry = request[:entry]
+        if (prev_log_entry = cursor.set_key(prev_log_index.to_bin, nil, true))
+          prev_log_entry = MessagePack.unpack(prev_log_entry.last)
+          if prev_log_entry[:term] != prev_log_term
             result[:success] = false
             break
           end
-          if log_entry[:term] == prev_log_term
-            if log_entry[:index] == prev_log_index
+          if prev_log_entry[:term] == prev_log_term
+            if prev_log_entry[:index] == prev_log_index
               result[:success] = true
             else
               result[:success] = false
               break
             end
           end
-        elsif cursor.last(nil, nil, true).nil?
+        elsif cursor.last(nil, nil, true).nil? || (prev_log_term == 0 && prev_log_index == 0)
           result[:success] = true
         else
           result[:success] = false
@@ -116,22 +115,30 @@ class Raft
           end
 
           cursor.put(index, entry.to_msgpack, MDB::APPEND)
-
-          if leader_commit > @commit_index
+        end
+        if leader_commit > @commit_index
+          if entry
             @commit_index = [leader_commit, entry[:index]].min
+          else
+            @commit_index = leader_commit
           end
         end
 
-        cursor.set_key(@last_applied.to_bin, nil, true)
-
+        called = false
+        response = nil
         while @commit_index > @last_applied
-          if (log_entry = cursor.next(nil, nil, true))
+          @last_applied += 1
+          if (log_entry = cursor.set_key(@last_applied.to_bin, nil, true))
             log_entry = MessagePack.unpack(log_entry.last)
-            @class.__send__(log_entry[:command][:method], *log_entry[:command][:args])
-            @last_applied += 1
+            response = @instance.__send__(log_entry[:command][:method], *log_entry[:command][:args])
+            called = true
           else
-            raise KeyError, "no such key: #{@last_applied}"
+            raise KeyError, "key not found #{@last_applied}"
           end
+        end
+
+        if called
+          @pipe.sendx({id: ActorMessage::SEND_OK, result: response}.to_msgpack)
         end
       end
 
@@ -145,15 +152,23 @@ class Raft
         enter_new_term(term)
       elsif request[:success]
         index = @peers[follower_id][:next_index]
-        @peers[follower_id][:next_index] += 1
-        @peers[follower_id][:match_index] = index
         if index > @commit_index && (log_entry = @log_db[index.to_bin])
           entry = MessagePack.unpack(log_entry.last)
           if entry[:term] == ct
+            @peers[follower_id][:next_index] += 1
+            @peers[follower_id][:match_index] = index
             matched_indexes = 1
             @peers.each_value do |peer|
               if peer[:match_index] >= index && (matched_indexes += 1) >= quorum
-                @commit_index = index
+                begin
+                  result = @instance.__send__(entry[:command][:method], *entry[:command][:args])
+                  @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
+                  @commit_index = index
+                  replicate_log(true)
+                  @timer.reset
+                rescue => e
+                  CZMQ::Zsys.error(e.inspect)
+                end
                 break
               end
             end
@@ -161,11 +176,7 @@ class Raft
         end
       elsif @peers[follower_id][:next_index] > 1 && (log_entry = @log_db[(@peers[follower_id][:next_index] -= 1).to_bin])
         log_entry = MessagePack.unpack(log_entry.last)
-        append_entry_rpc = {rpc: :append_entry,
-          term: current_term,
-          prev_log_index: log_entry[:index] - 1,
-          entry: log_entry,
-          leader_commit: @commit_index}
+        append_entry_rpc = {rpc: :append_entry, term: current_term, prev_log_index: log_entry[:index] - 1, entry: log_entry, leader_commit: @commit_index}
         if (prev_log_entry = @log_db[append_entry_rpc[:prev_log_index].to_bin])
           prev_log_entry = MessagePack.unpack(prev_log_entry.last)
           append_entry_rpc[:prev_log_term] = prev_log_entry[:term]
@@ -207,12 +218,8 @@ class Raft
       term = request[:term]
       if term > current_term
         enter_new_term(term)
-      else
-        if candidate? && request[:vote_granted]
-          if (@recieved_votes += 1) >= quorum
-            transition :leader
-          end
-        end
+      elsif candidate? && request[:vote_granted] && (@recieved_votes += 1) >= quorum
+        transition :leader
       end
     end
 
@@ -235,23 +242,7 @@ class Raft
     def pipe(pipe_pi)
       msg = CZMQ::Zframe.recv(@pipe).to_str
       payload = MessagePack.unpack(msg)
-      case payload[:id]
-      when ActorMessage::SEND_MESSAGE
-        begin
-          append_entry(msg, payload)
-          replicate_log
-          result = @instance.__send__(payload[:command][:method], *payload[:command][:args])
-          @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
-        rescue => e
-          @pipe.sendx({id: ActorMessage::ERROR, mrb_class: e.class, error: e.to_s}.to_msgpack)
-        end
-      when ActorMessage::ASYNC_SEND_MESSAGE
-        begin
-          @instance.__send__(payload[:command][:method], *payload[:command][:args])
-        rescue => e
-          CZMQ::Zsys.error(e.inspect)
-        end
-      end
+      append_entry(msg, payload)
     end
 
     def zyre(zyre_socket_pi)
@@ -280,7 +271,7 @@ class Raft
         when :append_entry
           @zyre.whisper(uuid, append_entry_rpc(name, request).to_msgpack)
         when :call
-          call(payload[:command][:method], *payload[:command][:args])
+          append_entry(msg, request)
         end
       when 'JOIN'
         channel = msg[3]
@@ -325,6 +316,7 @@ class Raft
           payload[:term] = current_term
           cursor.put(payload[:index].to_bin, payload.to_msgpack, MDB::APPEND)
         end
+        replicate_log
       elsif @leader_id
         @zyre.whisper(@peers[@leader_id][:uuid], msg)
       else
@@ -333,10 +325,7 @@ class Raft
     end
 
     def replicate_log(is_heartbeat = false)
-      append_entry_rpc = {rpc: :append_entry,
-        term: current_term,
-        leader_commit: @commit_index}
-
+      append_entry_rpc = {rpc: :append_entry, term: current_term, leader_commit: @commit_index}
       last_log_index = 0
 
       @log_db.cursor(MDB::RDONLY) do |cursor|
