@@ -124,21 +124,19 @@ class Raft
           end
         end
 
-        called = false
-        response = nil
         while @commit_index > @last_applied
           @last_applied += 1
           if (log_entry = cursor.set_key(@last_applied.to_bin, nil, true))
             log_entry = MessagePack.unpack(log_entry.last)
             response = @instance.__send__(log_entry[:command][:method], *log_entry[:command][:args])
-            called = true
+            if @pipe_awaits == log_entry[:uuid]
+              @pipe.sendx({id: ActorMessage::SEND_OK, result: response}.to_msgpack)
+              @pipe_awaits = false
+            end
           else
-            raise KeyError, "key not found #{@last_applied}"
+            @last_applied -= 1
+            break
           end
-        end
-
-        if called
-          @pipe.sendx({id: ActorMessage::SEND_OK, result: response}.to_msgpack)
         end
       end
 
@@ -162,8 +160,11 @@ class Raft
               if peer[:match_index] >= index && (matched_indexes += 1) >= quorum
                 begin
                   result = @instance.__send__(entry[:command][:method], *entry[:command][:args])
-                  @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
-                  @commit_index = index
+                  if @pipe_awaits == entry[:uuid]
+                    @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
+                    @pipe_awaits = false
+                  end
+                  @commit_index = @last_applied = index
                   replicate_log(true)
                   @timer.reset
                 rescue => e
@@ -242,7 +243,7 @@ class Raft
     def pipe(pipe_pi)
       msg = CZMQ::Zframe.recv(@pipe).to_str
       payload = MessagePack.unpack(msg)
-      append_entry(msg, payload)
+      append_entry(msg, payload, true)
     end
 
     def zyre(zyre_socket_pi)
@@ -313,7 +314,10 @@ class Raft
       end
     end
 
-    def append_entry(msg, payload)
+    def append_entry(msg, payload, from_pipe = false)
+      if from_pipe
+        @pipe_awaits = payload[:uuid]
+      end
       if leader?
         @log_db.cursor do |cursor|
           if (log_entry = cursor.last(nil, nil, true))
