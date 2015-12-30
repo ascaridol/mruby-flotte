@@ -3,7 +3,7 @@ raft consensus algorithm in mruby
 
 WARNING
 =======
-this is almost completely untested, what is only working so far is log replication, log replay and state machine calls, but only under certain circumstances.
+this is almost completely untested, what is working so far is leader election, log replication, log replay and state machine calls, but only tested under certain circumstances.
 
 Prerequirements
 ===============
