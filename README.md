@@ -13,11 +13,18 @@ Example
 =======
 
 ```ruby
-raft1 = Raft.new({name: '1', class: String}, 'hallo')
-raft2 = Raft.new({name: '2', class: String}, 'hallo')
-raft3 = Raft.new({name: '3', class: String}, 'hallo')
+raft1 = Raft.new({name: '1', class: Raft::Counter})
+raft2 = Raft.new({name: '2', class: Raft::Counter})
+raft3 = Raft.new({name: '3', class: Raft::Counter})
 
-puts raft1.send(:to_s)
-puts raft2.send(:to_s)
-puts raft3.send(:to_s)
+CZMQ::Zclock.sleep(300)
+
+puts raft1.send(:incr)
+puts raft2.send(:incr)
+puts raft3.send(:incr)
+
+puts raft1.send(:counter)
+puts raft2.send(:counter)
+puts raft3.send(:counter)
+
 ```
