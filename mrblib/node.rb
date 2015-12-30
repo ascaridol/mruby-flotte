@@ -152,24 +152,15 @@ class Raft
         index = @peers[follower_id][:next_index]
         if index > @commit_index && (log_entry = @log_db[index.to_bin])
           entry = MessagePack.unpack(log_entry.last)
+          @peers[follower_id][:next_index] += 1
+          @peers[follower_id][:match_index] = index
           if entry[:term] == ct
-            @peers[follower_id][:next_index] += 1
-            @peers[follower_id][:match_index] = index
             matched_indexes = 1
             @peers.each_value do |peer|
               if peer[:match_index] >= index && (matched_indexes += 1) >= quorum
-                begin
-                  result = @instance.__send__(entry[:command][:method], *entry[:command][:args])
-                  if @pipe_awaits == entry[:uuid]
-                    @pipe.sendx({id: ActorMessage::SEND_OK, result: result}.to_msgpack)
-                    @pipe_awaits = false
-                  end
-                  @commit_index = @last_applied = index
-                  replicate_log(true)
-                  @timer.reset
-                rescue => e
-                  CZMQ::Zsys.error(e.inspect)
-                end
+                @commit_index = index
+                replicate_log(true)
+                @timer.reset
                 break
               end
             end
@@ -185,6 +176,24 @@ class Raft
           append_entry_rpc[:prev_log_term] = 0
         end
         @zyre.whisper(@peers[follower_id][:uuid], append_entry_rpc.to_msgpack)
+      end
+
+      @log_db.cursor(MDB::RDONLY) do |cursor|
+        while @commit_index > @last_applied
+          @last_applied += 1
+
+          if (log_entry = cursor.set_key(@last_applied.to_bin, nil, true))
+            log_entry = MessagePack.unpack(log_entry.last)
+            response = @instance.__send__(log_entry[:command][:method], *log_entry[:command][:args])
+            if @pipe_awaits == log_entry[:uuid]
+              @pipe.sendx({id: ActorMessage::SEND_OK, result: response}.to_msgpack)
+              @pipe_awaits = false
+            end
+          else
+            @last_applied -= 1
+            break
+          end
+        end
       end
     end
 
