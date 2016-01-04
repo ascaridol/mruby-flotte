@@ -1,7 +1,4 @@
 class Raft
-  class Error < StandardError; end
-  class LogError < Error; end
-
   class Node
     include StateMachine
 
@@ -48,10 +45,10 @@ class Raft
       @reactor.poller(@zyre.socket, &method(:zyre))
       @zyre.start
       @zyre.join(@channel)
+      @timer = @reactor.timer(150 + RandomBytes.uniform(150), 0, &method(:timer))
     end
 
     def start
-      @timer ||= @reactor.timer(150 + RandomBytes.uniform(150), 0, &method(:timer))
       @reactor.run
     end
 
@@ -71,27 +68,30 @@ class Raft
 
       success = @storage.validate_request(request)
 
-      last_index = nil
-      if success && request[:entry]
-        @storage.append_entry(request[:entry])
-        last_index = request[:entry][:index]
-      end
-
-      leader_commit = request[:leader_commit]
-      if leader_commit > @commit_index
-        if last_index
-          @commit_index = [leader_commit, last_index].min
-        elsif (last_entry = @storage.last_log_entry)
-          @commit_index = [leader_commit, last_entry[:index]].min
+      if success
+        entry = request[:entry]
+        last_index = nil
+        if entry
+          @storage.append_entry(entry)
+          last_index = entry[:index]
         end
-      end
 
-      while @commit_index > @last_applied
-        log_entry = @storage.log_entry(@last_applied += 1)
-        response = @instance.__send__(log_entry[:command][:method], *log_entry[:command][:args])
-        if @pipe_awaits == log_entry[:uuid]
-          @pipe.sendx({id: ActorMessage::SEND_OK, result: response}.to_msgpack)
-          @pipe_awaits = false
+        leader_commit = request[:leader_commit]
+        if leader_commit > @commit_index
+          if last_index
+            @commit_index = [leader_commit, last_index].min
+          else
+            @commit_index = [leader_commit, @storage.last_log_entry[:index]].min
+          end
+        end
+
+        while @commit_index > @last_applied
+          log_entry = @storage.log_entry(@last_applied += 1)
+          response = @instance.__send__(log_entry[:command][:method], *log_entry[:command][:args])
+          if @pipe_awaits == log_entry[:uuid]
+            @pipe.sendx({id: ActorMessage::SEND_OK, result: response}.to_msgpack)
+            @pipe_awaits = false
+          end
         end
       end
 
@@ -103,35 +103,37 @@ class Raft
       term = response[:term]
       if term > ct
         enter_new_term(term)
-        return
       end
-      if response[:success]
-        index = @peers[follower_id][:next_index]
-        if index > @commit_index && (log_entry = @storage.log_entry(index))
-          @peers[follower_id][:next_index] += 1
-          @peers[follower_id][:match_index] = index
-          if log_entry[:term] == ct
-            matched_indexes = 1
-            @peers.each_value do |peer|
-              if peer[:match_index] >= index && (matched_indexes += 1) >= quorum
-                @commit_index = index
-                replicate_log(true)
-                @timer.reset
-                break
+
+      if leader?
+        peer = @peers[follower_id]
+        if response[:success]
+          index = peer[:next_index]
+          if index > @commit_index && (log_entry = @storage.log_entry(index))
+            peer[:next_index] += 1
+            peer[:match_index] = index
+            if log_entry[:term] == ct
+              matched_indexes = 1
+              @peers.each_value do |peer|
+                if peer[:match_index] >= index && (matched_indexes += 1) >= quorum
+                  @commit_index = index
+                  replicate_log(true)
+                  @timer.reset
+                  break
+                end
               end
             end
           end
-        end
-      else
-        peer = @peers[follower_id]
-        peer[:next_index] -= 1
-        if (log_entry = @storage.log_entry(peer[:next_index]))
-          append_entry_rpc = {rpc: :append_entry, term: ct, entry: log_entry, leader_commit: @commit_index}
-          if (prev_log_entry = @storage.log_entry(log_entry[:index] - 1))
-            append_entry_rpc[:prev_log_index] = prev_log_entry[:index]
-            append_entry_rpc[:prev_log_term] = prev_log_entry[:term]
+        else
+          peer[:next_index] -= 1
+          if (log_entry = @storage.log_entry(peer[:next_index]))
+            append_entry_rpc = {rpc: :append_entry, term: ct, entry: log_entry, leader_commit: @commit_index}
+            if (prev_log_entry = @storage.log_entry(log_entry[:index] - 1))
+              append_entry_rpc[:prev_log_index] = prev_log_entry[:index]
+              append_entry_rpc[:prev_log_term] = prev_log_entry[:term]
+            end
+            @zyre.whisper(peer[:uuid], append_entry_rpc.to_msgpack)
           end
-          @zyre.whisper(peer[:uuid], append_entry_rpc.to_msgpack)
         end
       end
 
@@ -158,8 +160,8 @@ class Raft
 
       vf = @storage.voted_for
       if vf == nil || vf == candidate_id
-        if (last_entry = @storage.last_log_entry)
-          if request[:last_log_index] >= last_entry[:index] && request[:last_log_term] >= last_entry[:term]
+        if (last_log_entry = @storage.last_log_entry)
+          if request[:last_log_index] >= last_log_entry[:index] && request[:last_log_term] >= last_log_entry[:term]
             @storage.voted_for = candidate_id
             @timer.reset
             vote_granted = true
@@ -183,45 +185,36 @@ class Raft
       end
     end
 
-    def start_new_election
-      new_term = @storage.increment_current_term
-      @storage.voted_for = @name
-      @recieved_votes = 1
-      request_vote_rpc = {rpc: :request_vote, term: new_term}
-      if (last_entry = @storage.last_log_entry)
-        request_vote_rpc[:last_log_index] = last_entry[:index]
-        request_vote_rpc[:last_log_term] = last_entry[:term]
-      else
-        request_vote_rpc[:last_log_index] = 0
-        request_vote_rpc[:last_log_term] = 0
-      end
-      @zyre.shout(@channel, request_vote_rpc.to_msgpack)
-      @timer.delay = 150 + RandomBytes.uniform(150)
-    end
-
     def pipe(pipe_pi)
       msg = CZMQ::Zframe.recv(@pipe).to_str
       payload = MessagePack.unpack(msg)
       append_entry(msg, payload, true)
     end
 
+    SHOUT = 'SHOUT'
+    WHISPER = 'WHISPER'
+    JOIN = 'JOIN'
+    EVASIVE = 'EVASIVE'
+    LEAVE = 'LEAVE'
+    EXIT = 'EXIT'
+
     def zyre(zyre_socket_pi)
       msg = @zyre.recv
-      type = msg[0]
-      uuid = msg[1]
+      type, uuid, name = msg[0], msg[1], msg[2]
       @evasive.delete(uuid)
-      name = msg[2]
       case type
-      when 'SHOUT'
+      when SHOUT
         channel = msg[3]
         if (channel == @channel)
           request = MessagePack.unpack(msg[4])
           case request[:rpc]
           when :request_vote
             @zyre.whisper(uuid, request_vote_rpc(name, request).to_msgpack)
+          when :append_entry
+            @zyre.whisper(uuid, append_entry_rpc(name, request).to_msgpack)
           end
         end
-      when 'WHISPER'
+      when WHISPER
         request = MessagePack.unpack(msg[3])
         case request[:rpc]
         when :request_vote_reply
@@ -233,7 +226,7 @@ class Raft
         when :call
           append_entry(msg, request)
         end
-      when 'JOIN'
+      when JOIN
         channel = msg[3]
         if channel == @channel
           if leader?
@@ -246,17 +239,19 @@ class Raft
             @peers[name] = {uuid: uuid}
           end
         end
-      when 'EVASIVE'
+      when EVASIVE
         unless @evasive.include?(uuid)
           @evasive << uuid
         end
-      when 'LEAVE'
+      when LEAVE
         channel = msg[3]
         if channel == @channel
           @peers.delete(name)
+          transition :candidate if @leader_id == name
         end
-      when 'EXIT'
+      when EXIT
         @peers.delete(name)
+        transition :candidate if @leader_id == name
       end
     end
 
@@ -269,6 +264,17 @@ class Raft
       when :leader
         replicate_log(true)
       end
+    end
+
+    def enter_new_term(new_term = nil)
+      if new_term
+        @storage.current_term = new_term
+      else
+        @storage.increment_current_term
+      end
+      @storage.reset_voted_for
+      @leader_id = nil
+      transition :follower
     end
 
     def append_entry(msg, payload, from_pipe = false)
@@ -285,33 +291,40 @@ class Raft
       end
     end
 
+    def start_new_election
+      new_term = @storage.increment_current_term
+      @storage.voted_for = @name
+      @recieved_votes = 1
+      request_vote_rpc = {rpc: :request_vote, term: new_term}
+      if (last_entry = @storage.last_log_entry)
+        request_vote_rpc[:last_log_index] = last_entry[:index]
+        request_vote_rpc[:last_log_term] = last_entry[:term]
+      else
+        request_vote_rpc[:last_log_index] = 0
+        request_vote_rpc[:last_log_term] = 0
+      end
+      @zyre.shout(@channel, request_vote_rpc.to_msgpack)
+      @timer.delay = 150 + RandomBytes.uniform(150)
+    end
+
     def replicate_log(is_heartbeat = false)
       append_entry_rpc = {rpc: :append_entry, term: @storage.current_term, leader_commit: @commit_index}
       last_log_index = @storage.build_log_replica(is_heartbeat, append_entry_rpc)
       append_entry_rpc = append_entry_rpc.to_msgpack
 
-      @peers.each_value do |peer|
-        if last_log_index >= peer[:next_index]
-          @zyre.whisper(peer[:uuid], append_entry_rpc)
-        elsif is_heartbeat
-          @zyre.whisper(peer[:uuid], append_entry_rpc)
+      if is_heartbeat
+        @zyre.shout(@channel, append_entry_rpc)
+      else
+        @peers.each_value do |peer|
+          if (last_log_index >= peer[:next_index])
+            @zyre.whisper(peer[:uuid], append_entry_rpc)
+          end
         end
       end
     end
 
     def quorum
       ((@peers.size - @evasive.size + 1) / 2).ceil
-    end
-
-    def enter_new_term(new_term = nil)
-      if new_term
-        @storage.current_term = new_term
-      else
-        @storage.increment_current_term
-      end
-      @storage.reset_voted_for
-      @leader_id = nil
-      transition :follower
     end
 
   end
